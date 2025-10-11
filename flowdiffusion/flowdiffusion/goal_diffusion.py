@@ -492,7 +492,7 @@ class GoalGaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_cond, task_embed,  clip_x_start=False, rederive_pred_noise=False):
+    def model_predictions(self, x, t, x_cond, task_embed,  clip_x_start=False, rederive_pred_noise=False, guidance_weight=0, target_labels=None):
         # task_embed = self.text_encoder(goal).last_hidden_state
         model_output = self.model(torch.cat([x, x_cond], dim=1), t, task_embed)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
@@ -516,6 +516,37 @@ class GoalGaussianDiffusion(nn.Module):
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
 
+        if target_labels is not None and guidance_weight > 0:
+            original_requires_grad = {}
+            for name, param in self.model.named_parameters():
+                original_requires_grad[name] = param.requires_grad
+                param.requires_grad_(True)
+            
+            x_in = x.detach().requires_grad_(True)
+
+            self.probe.activations.clear()
+
+            z = self.probe.activations["end_input_blocks"]
+            z.retain_grad()
+            
+            #import pdb; pdb.set_trace()
+            logits = self.fail_classifier(z, t)
+            #logits = self.fail_classifier(z)
+
+            loss = F.cross_entropy(logits, target_labels)
+
+            # Compute gradients wrt to all model parameters and inputs
+            loss.backward()
+
+            self.recorded_data["classifier_scores"].append(F.softmax(logits, dim=1)[:, 0].mean().item())
+            self.recorded_data["loss"].append(loss.item())
+
+            pred_noise = pred_noise - guidance_weight * x_in.grad
+
+            # Restore original requires_grad state
+            for name, param in self.model.named_parameters():
+                param.requires_grad_(original_requires_grad[name])
+
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, x_cond, task_embed,  clip_denoised = False):
@@ -532,75 +563,9 @@ class GoalGaussianDiffusion(nn.Module):
     def p_sample(self, x, t: int, x_cond, task_embed, guidance_weight=0, target_labels=None):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
-
-        if target_labels is not None and guidance_weight > 0.0:
-            # Store original requires_grad state of model parameters
-            original_requires_grad = {}
-            for name, param in self.model.named_parameters():
-                original_requires_grad[name] = param.requires_grad
-                param.requires_grad_(True)
-            
-            x_in = x.detach().requires_grad_(True)
-
-            self.probe.activations.clear()
-
-            # Run forward pass with gradient-enabled input to get probe activations
-            preds = self.model_predictions(x_in, batched_times, x_cond, task_embed)
-            pred_noise = preds.pred_noise
-            x_start = preds.pred_x_start
-
-            z = self.probe.activations["end_input_blocks"]
-            z.retain_grad()
-            
-            #import pdb; pdb.set_trace()
-            batch_time = torch.full((b, 7), t, dtype=torch.float32).to(device)
-            #batch_time = batch_time.requires_grad_(True)
-            logits = self.fail_classifier(z, batch_time)
-            #logits = self.fail_classifier(z)
-
-            loss = F.cross_entropy(logits, target_labels)
-
-            # Compute gradients wrt to all model parameters and inputs
-            loss.backward()
-
-            #print(z.grad.shape)
-            #print(np.linalg.norm(z.grad.detach().cpu().numpy()))
-            #print(x_in.shape)
-            #print(np.linalg.norm(x_in.detach().cpu().numpy()))
-            #print(x_in.grad.shape)
-            #print(np.linalg.norm(x_in.grad.detach().cpu().numpy()))
-            #print(loss)
-            #exit()
-
-            self.recorded_data["classifier_scores"].append(F.softmax(logits, dim=1)[:, 0].mean().item())
-            self.recorded_data["loss"].append(loss.item())
-
-            #test_logits = self.fail_classifier(z - 100*z.grad, batch_time)
-
-            #print(logits)
-            #print(test_logits)
-
-            pred_noise = pred_noise - guidance_weight * x_in.grad
-            x_start = self.predict_start_from_noise(x, batched_times, pred_noise)
-
-            # Restore original requires_grad state
-            for name, param in self.model.named_parameters():
-                param.requires_grad_(original_requires_grad[name])
-
-        else:
-            # Normal forward pass without gradients
-            preds = self.model_predictions(x, batched_times, x_cond, task_embed)
-            pred_noise = preds.pred_noise
-            x_start = preds.pred_x_start
-
-            x_start = self.predict_start_from_noise(x, batched_times, pred_noise)
-
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x, batched_times, x_cond, task_embed, clip_denoised = True)
-        model_mean, _, _ = self.q_posterior(x_start = x_start, x_t = x, t = batched_times)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
-
-
         return pred_img, x_start
 
     #@torch.no_grad()
@@ -619,6 +584,8 @@ class GoalGaussianDiffusion(nn.Module):
             img, _ = self.p_sample(img, t, x_cond, task_embed, guidance_weight=self.guidance_weight, target_labels=torch.tensor([[1, 0] for _ in range(7)], dtype=torch.float32, device=x_cond.device))
             imgs.append(img)
 
+            torch.cuda.empty_cache()
+
             #import pdb; pdb.set_trace()
 
             # if t % 10 == 9:
@@ -626,8 +593,8 @@ class GoalGaussianDiffusion(nn.Module):
 
         fig, ax1 = plt.subplots(figsize=(10, 6))
 
-        ax1.set_title("Classifier Score and Loss over Epochs")
-        ax1.set_xlabel("Epoch")
+        ax1.set_title("Classifier Score and Loss over Diffusion Time Steps")
+        ax1.set_xlabel("Diffusion Time Step")
         ax1.set_ylabel("Loss", color='tab:blue')
         ax1.plot(self.recorded_data["loss"], label='Loss', color='tab:blue')
         ax1.tick_params(axis='y', labelcolor='tab:blue')
@@ -643,6 +610,7 @@ class GoalGaussianDiffusion(nn.Module):
         ax2.legend(loc='upper right')
 
         plt.savefig(os.path.join(self.save_path, "classifier_score_and_loss.png"))
+        self.recorded_data = {"classifier_scores": [], "loss": []}
 
 
 
